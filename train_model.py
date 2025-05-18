@@ -23,9 +23,9 @@ def add_features(df):
 
 # --- Multi-timeframe merge ---
 def merge_timeframes(df1m):
-    df1m['datetime'] = pd.to_datetime(df1m['date'] + ' ' + df1m['time'])
+    df1m['datetime'] = pd.to_datetime(df1m['date'] + ' ' + df1m['time'], format='%m/%d/%Y %I:%M:%S %p')
     df1m.set_index('datetime', inplace=True)
-    df5m = df1m.resample('5T').agg({
+    df5m = df1m.resample('5min').agg({
         'open': 'first',
         'high': 'max',
         'low': 'min',
