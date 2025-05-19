@@ -10,7 +10,7 @@ from sklearn.model_selection import train_test_split
 import MetaTrader5 as mt5
 import talib
 import time
-
+from torch.utils.data import DataLoader, TensorDataset
 # ===========================
 # Section 1: Model Definition
 # ===========================
@@ -71,40 +71,50 @@ def prepare_sequences(df, feature_cols):
 def train_model(csv_file, model_path="best_model.pth", scaler_path="scaler.pkl"):
     df = pd.read_csv(csv_file)
     df = add_features(df)
+    df = df.tail(20000)  # فقط ۲۰۰۰۰ رکورد آخر برای آموزش
     feature_cols = ['open','high','low','close','spread','tick_volume',
                     'EMA_10','RSI_14','MACD_hist','BB_width','VWAP']
     
     X, y, scaler = prepare_sequences(df, feature_cols)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
 
+    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
+    val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
+    
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=256)
+
     model = CNNBiLSTMAttention(input_size=X.shape[2]).to(device)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0], device=device))
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train = torch.tensor(y_train, dtype=torch.long).to(device)
-    X_val = torch.tensor(X_val, dtype=torch.float32).to(device)
-    y_val = torch.tensor(y_val, dtype=torch.long).to(device)
-
     best_val_acc = 0
     for epoch in range(15):
         model.train()
-        optimizer.zero_grad()
-        output = model(X_train)
-        loss = criterion(output, y_train)
-        loss.backward()
-        optimizer.step()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            output = model(xb)
+            loss = criterion(output, yb)
+            loss.backward()
+            optimizer.step()
 
         model.eval()
+        val_correct, val_total = 0, 0
         with torch.no_grad():
-            val_pred = torch.argmax(model(X_val), dim=1)
-            val_acc = (val_pred == y_val).float().mean().item()
-            print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}, Val Acc: {val_acc:.4f}")
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(model.state_dict(), model_path)
-                joblib.dump(scaler, scaler_path)
-                np.save("features.npy", np.array(feature_cols))
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                pred = torch.argmax(model(xb), dim=1)
+                val_correct += (pred == yb).sum().item()
+                val_total += yb.size(0)
+
+        val_acc = val_correct / val_total
+        print(f"Epoch {epoch+1}, Val Acc: {val_acc:.4f}")
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), model_path)
+            joblib.dump(scaler, scaler_path)
+            np.save("features.npy", np.array(feature_cols))
 
     return model, scaler, feature_cols
 
