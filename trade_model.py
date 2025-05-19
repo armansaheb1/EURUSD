@@ -1,126 +1,201 @@
-import MetaTrader5 as mt5
+import os
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
+import joblib
 from sklearn.preprocessing import StandardScaler
-from datetime import datetime
+from sklearn.model_selection import train_test_split
+import MetaTrader5 as mt5
+import talib
 import time
-import os
 
-# تنظیمات اولیه
-SYMBOL = "EURUSD"
-TIMEFRAME = mt5.TIMEFRAME_M1
-SEQ_LEN = 30
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# کلاس مدل (همانند train.py)
-class DirectionPredictor(nn.Module):
-    def __init__(self, input_size):
-        super(DirectionPredictor, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv1d(input_size, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU()
-        )
-        self.lstm = nn.LSTM(128, 64, batch_first=True, bidirectional=True)
-        self.attn = nn.Linear(128, 1)
-        self.fc = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2)
-        )
+# ===========================
+# Section 1: Model Definition
+# ===========================
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attn = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        x = self.cnn(x.permute(0, 2, 1)).permute(0, 2, 1)
-        lstm_out, _ = self.lstm(x)
-        attn_weights = torch.softmax(self.attn(lstm_out), dim=1)
-        context = torch.sum(attn_weights * lstm_out, dim=1)
-        return self.fc(context)
+        weights = torch.softmax(self.attn(x).squeeze(-1), dim=1).unsqueeze(-1)
+        return (x * weights).sum(dim=1)
 
-# بارگذاری مدل
-model = DirectionPredictor(input_size=10).to(DEVICE)
-model.load_state_dict(torch.load("model.pt", map_location=DEVICE))
-model.eval()
+class CNNBiLSTMAttention(nn.Module):
+    def __init__(self, input_size, hidden_size=128):
+        super().__init__()
+        self.cnn = nn.Conv1d(input_size, 64, kernel_size=3, padding=1)
+        self.bilstm = nn.LSTM(64, hidden_size, batch_first=True, bidirectional=True)
+        self.attn = Attention(hidden_size * 2)
+        self.fc = nn.Linear(hidden_size * 2, 2)
 
-# شروع متاتریدر
-if not mt5.initialize():
-    raise RuntimeError("MT5 initialization failed")
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = torch.relu(self.cnn(x))
+        x = x.permute(0, 2, 1)
+        x, _ = self.bilstm(x)
+        x = self.attn(x)
+        return self.fc(x)
 
-# بررسی باز بودن معامله
-def trade_is_open():
-    positions = mt5.positions_get(symbol=SYMBOL)
-    return len(positions) > 0
+# ===========================
+# Section 2: Training Setup
+# ===========================
+SEQ_LEN = 60
+device = torch.device("cpu")
 
-# دریافت داده‌های زنده
-def get_live_data(n=SEQ_LEN):
-    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, n)
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
+def add_features(df):
+    df['return'] = df['close'].pct_change()
+    df['future_return'] = df['close'].shift(-5) / df['close'] - 1
+    df['target'] = np.where(df['future_return'] > 0, 1, 0)
+    df['EMA_10'] = talib.EMA(df['close'], timeperiod=10)
+    df['RSI_14'] = talib.RSI(df['close'], timeperiod=14)
+    macd, signal, _ = talib.MACD(df['close'])
+    df['MACD_hist'] = macd - signal
+    upper, middle, lower = talib.BBANDS(df['close'])
+    df['BB_width'] = upper - lower
+    df['VWAP'] = (df['close'] * df['tick_volume']).cumsum() / df['tick_volume'].replace(0, np.nan).cumsum()
+    df.dropna(inplace=True)
     return df
 
-# پیش‌پردازش داده‌ها
-def preprocess(df, scaler=None):
-    df['returns'] = df['close'].pct_change().fillna(0)
-    df['hl'] = df['high'] - df['low']
-    df['oc'] = df['close'] - df['open']
-    features = df[['open', 'high', 'low', 'close', 'tick_volume', 'volume', 'spread', 'returns', 'hl', 'oc']]
-    if scaler is None:
-        scaler = StandardScaler()
-        features = scaler.fit_transform(features)
-    else:
-        features = scaler.transform(features)
-    return features, scaler
+def prepare_sequences(df, feature_cols):
+    scaler = StandardScaler()
+    features = scaler.fit_transform(df[feature_cols])
+    X, y = [], []
+    for i in range(SEQ_LEN, len(df)):
+        X.append(features[i-SEQ_LEN:i])
+        y.append(df['target'].iloc[i])
+    return np.array(X), np.array(y), scaler
 
-# اجرای پیش‌بینی
-def predict_direction():
-    df = get_live_data(SEQ_LEN + 1)
-    if df.shape[0] < SEQ_LEN + 1:
-        return None
-    X, _ = preprocess(df)
-    x_seq = torch.tensor(X[-SEQ_LEN:], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+def train_model(csv_file, model_path="best_model.pth", scaler_path="scaler.pkl"):
+    df = pd.read_csv(csv_file)
+    df = add_features(df)
+    feature_cols = ['open','high','low','close','spread','tick_volume',
+                    'EMA_10','RSI_14','MACD_hist','BB_width','VWAP']
+    
+    X, y, scaler = prepare_sequences(df, feature_cols)
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    model = CNNBiLSTMAttention(input_size=X.shape[2]).to(device)
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0], device=device))
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+    y_train = torch.tensor(y_train, dtype=torch.long).to(device)
+    X_val = torch.tensor(X_val, dtype=torch.float32).to(device)
+    y_val = torch.tensor(y_val, dtype=torch.long).to(device)
+
+    best_val_acc = 0
+    for epoch in range(15):
+        model.train()
+        optimizer.zero_grad()
+        output = model(X_train)
+        loss = criterion(output, y_train)
+        loss.backward()
+        optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_pred = torch.argmax(model(X_val), dim=1)
+            val_acc = (val_pred == y_val).float().mean().item()
+            print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}, Val Acc: {val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), model_path)
+                joblib.dump(scaler, scaler_path)
+                np.save("features.npy", np.array(feature_cols))
+
+    return model, scaler, feature_cols
+
+# ===========================
+# Section 3: Trader
+# ===========================
+SYMBOL = "EURUSD-VIP"
+VOLUME = 0.01
+
+def get_data(symbol, n=500, tf=mt5.TIMEFRAME_M1):
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, n)
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df.rename(columns={'time':'datetime'}, inplace=True)
+    return df
+
+def make_trade(model, scaler, feature_cols):
+    df = get_data(SYMBOL, n=500)
+    df = add_features(df)
+    df = df[-(SEQ_LEN+1):]
+    if len(df) < SEQ_LEN+1:
+        return
+    features = scaler.transform(df[feature_cols])
+    X_live = torch.tensor(features[-SEQ_LEN:], dtype=torch.float32).unsqueeze(0).to(device)
+
+    model.eval()
     with torch.no_grad():
-        logits = model(x_seq)
-        pred = torch.argmax(logits, dim=1).item()
-    return pred  # 0: Sell, 1: Buy
+        pred = torch.argmax(model(X_live), dim=1).item()
 
-# ارسال سفارش
-def place_order(direction):
-    price = mt5.symbol_info_tick(SYMBOL).ask if direction == 1 else mt5.symbol_info_tick(SYMBOL).bid
-    volume = mt5.account_info().balance * 0.001 / price  # 0.1% سرمایه
-    order_type = mt5.ORDER_TYPE_BUY if direction == 1 else mt5.ORDER_TYPE_SELL
+    tick = mt5.symbol_info_tick(SYMBOL)
+    price = tick.ask if pred == 1 else tick.bid
+    atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+    atr = max(atr, 0.0003)
+
+    if pred == 1:
+        sl, tp = price - atr * 1.5, price + atr * 3
+        order_type = mt5.ORDER_TYPE_BUY
+    else:
+        sl, tp = price + atr * 1.5, price - atr * 3
+        order_type = mt5.ORDER_TYPE_SELL
+
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": SYMBOL,
-        "volume": round(volume, 2),
+        "volume": VOLUME,
         "type": order_type,
         "price": price,
+        "sl": sl,
+        "tp": tp,
         "deviation": 10,
         "magic": 123456,
-        "comment": "AutoTrade",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC
+        "comment": "auto-trade",
+        "type_filling": mt5.ORDER_FILLING_RETURN,
     }
-    result = mt5.order_send(request)
-    return result
 
-# حلقه اصلی
-print("Started auto trader...")
-scaler = None
-while True:
-    try:
-        if not trade_is_open():
-            df = get_live_data(SEQ_LEN + 1)
-            if df.shape[0] < SEQ_LEN + 1:
-                time.sleep(10)
-                continue
-            X, scaler = preprocess(df, scaler)
-            direction = predict_direction()
-            if direction is not None:
-                result = place_order(direction)
-                print(f"{datetime.now()} - Signal: {'Buy' if direction==1 else 'Sell'} - Order: {result.retcode}")
-        time.sleep(60)  # هر دقیقه یکبار بررسی
-    except Exception as e:
-        print(f"Error: {e}")
+    result = mt5.order_send(request)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        print(f"✅ Trade sent: {'BUY' if pred==1 else 'SELL'} at {price:.5f}")
+    else:
+        print("❌ Order failed:", result.comment)
+
+def run_trader_loop(model, scaler, feature_cols):
+    if not mt5.initialize():
+        print("MT5 init failed")
+        return
+    while True:
+        pos = mt5.positions_get(symbol=SYMBOL)
+        if pos and len(pos) > 0:
+            print("⏳ Position already open. Waiting...")
+        else:
+            make_trade(model, scaler, feature_cols)
         time.sleep(60)
+
+# ===========================
+# Main Logic
+# ===========================
+if __name__ == "__main__":
+    model_path = "best_model.pth"
+    scaler_path = "scaler.pkl"
+    features_path = "features.npy"
+
+    if os.path.exists(model_path) and os.path.exists(scaler_path) and os.path.exists(features_path):
+        print("📦 Loading model & scaler...")
+        dummy_input = torch.zeros((1, SEQ_LEN, len(np.load(features_path))))
+        model = CNNBiLSTMAttention(input_size=dummy_input.shape[2]).to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
+        scaler = joblib.load(scaler_path)
+        feature_cols = np.load(features_path).tolist()
+    else:
+        print("🔧 No model found. Training...")
+        model, scaler, feature_cols = train_model("m1.csv", model_path, scaler_path)
+
+    run_trader_loop(model, scaler, feature_cols)

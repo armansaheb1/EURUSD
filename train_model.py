@@ -22,18 +22,30 @@ def add_features(df):
     return df.dropna()
 
 # --- Multi-timeframe merge ---
-def merge_timeframes(df1m):
-    df1m['datetime'] = pd.to_datetime(df1m['date'] + ' ' + df1m['time'], format='%m/%d/%Y %I:%M:%S %p')
+def merge_timeframes(df1m, d=True):
+    if d==True:
+        df1m['datetime'] = pd.to_datetime(df1m['date'] + ' ' + df1m['time'], format='%m/%d/%Y %I:%M:%S %p')
     df1m.set_index('datetime', inplace=True)
-    df5m = df1m.resample('5min').agg({
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'tick_volume': 'sum',
-        'volume': 'sum',
-        'spread': 'mean'
-    }).dropna().rename(columns={c: f'{c}_5m' for c in df1m.columns})
+    if d==True:
+        df5m = df1m.resample('5min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'tick_volume': 'sum',
+            'volume': 'sum',
+            'spread': 'mean'
+        }).dropna().rename(columns={c: f'{c}_5m' for c in df1m.columns})
+    else:
+        df5m = df1m.resample('5min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'tick_volume': 'sum',
+            'real_volume': 'sum',
+            'spread': 'mean'
+        }).dropna().rename(columns={c: f'{c}_5m' for c in df1m.columns})
     df = df1m.join(df5m, how='inner')
     df.reset_index(drop=False, inplace=True)
     return df
@@ -57,6 +69,9 @@ def load_data(file_path, seq_len=60):
 
     scaler = MinMaxScaler()
     X_scaled = scaler.fit_transform(features)
+    import joblib
+    joblib.dump(scaler, "scaler.save")
+    np.save("feature_order.npy", features.columns.to_numpy())
 
     X_seq = []
     y_seq = []
@@ -66,6 +81,7 @@ def load_data(file_path, seq_len=60):
     
     X_seq = torch.tensor(np.array(X_seq), dtype=torch.float32)
     y_seq = torch.tensor(np.array(y_seq), dtype=torch.long)
+    
     return X_seq, y_seq, scaler
 
 # --- Attention ---
@@ -97,7 +113,7 @@ class CNNBiLSTMAttention(nn.Module):
 
 # --- Training ---
 def train(file='m1.csv', seq_len=60, batch_size=128, epochs=30, val_ratio=0.1):
-    X, y, _ = load_data(file, seq_len)
+    X, y, scaler = load_data(file, seq_len)
     dataset = TensorDataset(X, y)
     val_len = int(len(dataset) * val_ratio)
     train_ds, val_ds = random_split(dataset, [len(dataset) - val_len, val_len])
@@ -145,11 +161,15 @@ def train(file='m1.csv', seq_len=60, batch_size=128, epochs=30, val_ratio=0.1):
             best_f1 = f1
             counter = 0
             torch.save(model.state_dict(), 'best_model.pth')
+            import joblib
+            joblib.dump(scaler, 'scaler.pkl')
         else:
             counter += 1
             if counter >= patience:
                 print("Early stopping.")
                 break
 
+
 if __name__ == "__main__":
     train()
+    
